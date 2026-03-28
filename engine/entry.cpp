@@ -10,6 +10,7 @@
 #include <cstring>
 #include <cstddef>   // offsetof
 #include <random>
+#include <chrono>
 #include <algorithm>
 #include <sstream>
 #include <iomanip>
@@ -186,9 +187,33 @@ int main(int argc, char* argv[]) {
         }
 
         if (vm_mode) {
-            std::mt19937 rng(std::random_device{}());
+            // Seed the RNG with multiple entropy sources so each build
+            // produces a completely different opcode map and stub layout.
+            std::random_device rd;
+            std::seed_seq seed_seq{
+                rd(), rd(), rd(), rd(),
+                static_cast<uint32_t>(std::chrono::high_resolution_clock::now()
+                    .time_since_epoch().count()),
+                static_cast<uint32_t>(std::chrono::high_resolution_clock::now()
+                    .time_since_epoch().count() >> 32),
+                static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&rd)),
+                static_cast<uint32_t>(GetCurrentProcessId()),
+            };
+            std::mt19937 rng(seed_seq);
+
+            // Generate the XOR key used for opcode map derivation, then
+            // scramble it further with a second mixing pass.
             uint8_t xor_key[32];
             for (auto& b : xor_key) b = static_cast<uint8_t>(rng());
+            // Extra mixing: fold timestamp bytes into the key
+            {
+                uint64_t ts = std::chrono::high_resolution_clock::now()
+                    .time_since_epoch().count();
+                for (int i = 0; i < 32; i++)
+                    xor_key[i] ^= static_cast<uint8_t>((ts >> ((i % 8) * 8)) & 0xFF)
+                                ^ static_cast<uint8_t>(rng() & 0xFF);
+            }
+
             uint8_t opmap[128], oprev[256];
             lifter::build_opcode_map(xor_key, opmap, oprev);
             struct VmRegionInfo {
@@ -319,7 +344,7 @@ int main(int argc, char* argv[]) {
                 uint32_t revmap_rva = new_rva + static_cast<uint32_t>(off_vmhdr)
                                       + static_cast<uint32_t>(offsetof(VmHeader, opcode_rev));
                 auto stub = lifter::build_vm_entry_stub(
-                    stub_rva_in_sec, bc_rva, revmap_rva, vm_iat_rva);
+                    stub_rva_in_sec, bc_rva, revmap_rva, vm_iat_rva, rng);
                 size_t stub_in_sec = off_stubs + stub_offsets[i];
                 memcpy(sec.data() + stub_in_sec, stub.data(), stub.size());
                 uint32_t foff = rva_to_offset(pe_data.data(), vri.original_rva);
@@ -332,8 +357,13 @@ int main(int argc, char* argv[]) {
                     pe_data[foff + 2] = (ud >> 8)  & 0xFF;
                     pe_data[foff + 3] = (ud >> 16) & 0xFF;
                     pe_data[foff + 4] = (ud >> 24) & 0xFF;
-                    for (uint32_t k = 5; k < vri.original_size; ++k)
-                        pe_data[foff + k] = 0x90;
+                    // Fill remaining space with anti-disasm junk instead of NOPs
+                    // This confuses x64dbg's linear sweep disassembler in the dead zone
+                    uint32_t junk_size = vri.original_size - 5;
+                    if (junk_size > 0) {
+                        opcode::generate_antidisasm_junk(
+                            pe_data.data() + foff + 5, junk_size, rng);
+                    }
                 }
                 std::cout << "[vm] region " << i << " stub @ 0x" << std::hex
                           << stub_rva_in_sec << std::dec << "\n";

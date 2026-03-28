@@ -383,4 +383,246 @@ namespace opcode {
         return result;
     }
 
+    // =========================================================================
+    // Anti-disassembly junk for dead code regions (after unconditional JMPs).
+    // These bytes are NEVER executed. They exist solely to break x64dbg's
+    // linear-sweep disassembler by emitting:
+    //   - Partial multi-byte opcode escapes (0x0F, 0x0F38, 0x0F3A)
+    //   - Bogus VEX/EVEX prefixes (0xC4, 0xC5, 0x62)
+    //   - LOCK prefix before invalid opcodes (triggers #UD, confuses disasm)
+    //   - Fake REX.W prefixes that eat the next "instruction"
+    //   - Overlapping jmp-into-middle patterns
+    //   - Invalid ModR/M + SIB combos that consume unpredictable lengths
+    // =========================================================================
+
+    // Emit a single anti-disasm pattern, returns bytes written
+    inline size_t emit_antidisasm_pattern(uint8_t* buf, size_t space, std::mt19937& rng) {
+        if (space == 0) return 0;
+
+        int pattern = rng() % 18;
+
+        switch (pattern) {
+
+        case 0: // Fake VEX 3-byte prefix (0xC4) + garbage → disasm tries to parse VEX fields
+            if (space >= 5) {
+                buf[0] = 0xC4;
+                buf[1] = rand_byte(rng) | 0xC0; // R/X bits set to look like reg-reg
+                buf[2] = rand_byte(rng);
+                buf[3] = 0x0F + (rng() % 0xF0); // "opcode" that doesn't exist in VEX map
+                buf[4] = rand_byte(rng);
+                return 5;
+            }
+            break;
+
+        case 1: // Fake VEX 2-byte prefix (0xC5) + garbage
+            if (space >= 4) {
+                buf[0] = 0xC5;
+                buf[1] = rand_byte(rng) | 0x80; // high bit set
+                buf[2] = rand_byte(rng);
+                buf[3] = modrm_rr(rand_reg(rng), rand_reg(rng));
+                return 4;
+            }
+            break;
+
+        case 2: // EVEX prefix (0x62) + 3 payload bytes → x64dbg tries to decode EVEX
+            if (space >= 6) {
+                buf[0] = 0x62;
+                buf[1] = rand_byte(rng) | 0xF0; // P0: set top bits
+                buf[2] = rand_byte(rng) | 0x04; // P1: W bit and some vvvv
+                buf[3] = rand_byte(rng);         // P2
+                buf[4] = rand_byte(rng);         // "opcode"
+                buf[5] = rand_byte(rng);         // "modrm"
+                return 6;
+            }
+            break;
+
+        case 3: // 0x0F escape + invalid second byte → disasm shows "???" or misparses length
+            if (space >= 3) {
+                buf[0] = 0x0F;
+                // Pick bytes that aren't valid 0x0F XX opcodes
+                uint8_t invalid_2nd[] = { 0x04, 0x0A, 0x0C, 0x24, 0x25, 0x26, 0x27, 0x36, 0x37, 0x39, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x07, 0x0E, 0xA6, 0xA7 };
+                buf[1] = invalid_2nd[rng() % sizeof(invalid_2nd)];
+                buf[2] = rand_byte(rng);
+                return 3;
+            }
+            break;
+
+        case 4: // 0x0F 0x3A (3-byte opcode map) + invalid opcode + imm8
+            if (space >= 5) {
+                buf[0] = 0x0F;
+                buf[1] = 0x3A;
+                buf[2] = 0xCC + (rng() % 0x30); // invalid opcode in 0F3A map
+                buf[3] = modrm_rr(rng() % 8, rng() % 8);
+                buf[4] = rand_byte(rng); // "imm8"
+                return 5;
+            }
+            break;
+
+        case 5: // 0x0F 0x38 + invalid opcode
+            if (space >= 4) {
+                buf[0] = 0x0F;
+                buf[1] = 0x38;
+                buf[2] = 0xF2 + (rng() % 0x0D); // high end of 0F38 map, mostly undefined
+                buf[3] = modrm_rr(rng() % 8, rng() % 8);
+                return 4;
+            }
+            break;
+
+        case 6: // LOCK + non-lockable opcode → #UD on execution, disasm shows "lock ???"
+            if (space >= 4) {
+                buf[0] = 0xF0; // LOCK
+                buf[1] = 0x48; // REX.W
+                buf[2] = 0x8D; // LEA (not lockable!)
+                buf[3] = modrm_rr(rand_reg(rng), rand_reg(rng));
+                return 4;
+            }
+            break;
+
+        case 7: // REX.W + 0xFF with /7 (invalid extension) → unknown instruction
+            if (space >= 3) {
+                buf[0] = 0x48; // REX.W
+                buf[1] = 0xFF;
+                buf[2] = 0xF8 | (rng() % 8); // mod=11, reg=7 (invalid for FF group)
+                return 3;
+            }
+            break;
+
+        case 8: // Fake CALL [RIP+disp32] with huge displacement → disasm shows call to garbage
+            if (space >= 6) {
+                buf[0] = 0xFF;
+                buf[1] = 0x15; // CALL [RIP+disp32]
+                buf[2] = rand_byte(rng);
+                buf[3] = rand_byte(rng);
+                buf[4] = rand_byte(rng);
+                buf[5] = rand_byte(rng);
+                return 6;
+            }
+            break;
+
+        case 9: // Overlapping: JMP +1 into middle of a multi-byte "instruction"
+            if (space >= 6) {
+                buf[0] = 0xEB; buf[1] = 0x01;  // JMP +1
+                buf[2] = 0x0F;                   // eaten by JMP, but disasm tries to decode 0F XX
+                buf[3] = 0x0F;                   // actual landing: this starts new "0F XX"
+                buf[4] = rand_byte(rng);          // garbage second byte
+                buf[5] = rand_byte(rng);
+                return 6;
+            }
+            break;
+
+        case 10: // Multiple redundant REX prefixes → only last is used, disasm may misparse
+            if (space >= 5) {
+                buf[0] = 0x40 | (rng() % 16); // REX
+                buf[1] = 0x40 | (rng() % 16); // REX (overrides first)
+                buf[2] = 0x40 | (rng() % 16); // REX (overrides second)
+                buf[3] = 0x0F;                 // two-byte escape
+                buf[4] = rand_byte(rng);       // garbage
+                return 5;
+            }
+            break;
+
+        case 11: // Segment override prefixes chained + garbage (x64 mostly ignores these)
+            if (space >= 5) {
+                uint8_t segs[] = { 0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65 };
+                buf[0] = segs[rng() % 6];
+                buf[1] = segs[rng() % 6];
+                buf[2] = 0x0F;
+                buf[3] = rand_byte(rng);
+                buf[4] = rand_byte(rng);
+                return 5;
+            }
+            break;
+
+        case 12: // 0xF3 0x0F (rep prefix + escape) with invalid opcode → fake SSE
+            if (space >= 4) {
+                buf[0] = 0xF3;
+                buf[1] = 0x0F;
+                uint8_t bad_sse[] = { 0x04, 0x0A, 0x24, 0x25, 0x26, 0x27, 0x36, 0x78, 0x79 };
+                buf[2] = bad_sse[rng() % sizeof(bad_sse)];
+                buf[3] = modrm_rr(rng() % 8, rng() % 8);
+                return 4;
+            }
+            break;
+
+        case 13: // 0xF2 0x0F (repne prefix + escape) with invalid opcode → fake SSE2
+            if (space >= 4) {
+                buf[0] = 0xF2;
+                buf[1] = 0x0F;
+                buf[2] = 0x04 + (rng() % 8); // mostly undefined in F2 0F map
+                buf[3] = modrm_rr(rng() % 8, rng() % 8);
+                return 4;
+            }
+            break;
+
+        case 14: // Incomplete RIP-relative MOV with SIB that eats extra bytes
+            if (space >= 7) {
+                buf[0] = 0x48;                     // REX.W
+                buf[1] = 0x8B;                     // MOV r64, r/m64
+                buf[2] = 0x04 | ((rng() % 8) << 3); // ModR/M: mod=00, rm=100 (SIB follows)
+                buf[3] = 0x25;                     // SIB: base=101 (disp32, no base), index=100 (none)
+                buf[4] = rand_byte(rng);           // disp32 byte 0
+                buf[5] = rand_byte(rng);           // disp32 byte 1
+                buf[6] = rand_byte(rng);           // disp32 byte 2 → incomplete! disasm expects byte 3
+                return 7;
+            }
+            break;
+
+        case 15: // UD2 (0x0F 0x0B) followed by garbage that looks like instruction stream
+            if (space >= 4) {
+                buf[0] = 0x0F;
+                buf[1] = 0x0B; // UD2 - guaranteed undefined instruction
+                buf[2] = 0x48 | (rng() % 8); // looks like REX prefix
+                buf[3] = rand_byte(rng);
+                return 4;
+            }
+            break;
+
+        case 16: // Fake JMP rel32 pointing into garbage → disasm follows and desyncs
+            if (space >= 7) {
+                buf[0] = 0xE9; // JMP rel32
+                // Small forward offset that lands in garbage
+                buf[1] = 0x00;
+                buf[2] = 0x01; // ~256 bytes forward (beyond this region)
+                buf[3] = 0x00;
+                buf[4] = 0x00;
+                buf[5] = 0x0F; // disasm tries these as next insn
+                buf[6] = rand_byte(rng);
+                return 7;
+            }
+            break;
+
+        case 17: // INT 0x29 + REX.W + partial opcode → disasm trips on INT imm8 length
+            if (space >= 4) {
+                buf[0] = 0xCD; // INT imm8
+                buf[1] = 0x48; // looks like REX.W to disasm scanning linearly
+                buf[2] = 0xFF;
+                buf[3] = 0x25; // JMP [rip+disp32]... but only 0 disp bytes follow
+                return 4;
+            }
+            break;
+        }
+
+        // Fallback: single garbage byte that isn't a valid 1-byte opcode
+        uint8_t bad_singles[] = { 0x06, 0x07, 0x0E, 0x16, 0x17, 0x1E, 0x1F, 0x27, 0x2F, 0x37, 0x3F, 0xD6, 0xF1 };
+        buf[0] = bad_singles[rng() % sizeof(bad_singles)];
+        return 1;
+    }
+
+    // Fill a buffer of `size` bytes with anti-disassembly junk.
+    // Designed to be used in dead code regions after unconditional JMPs
+    // to maximally confuse x64dbg's linear sweep disassembler.
+    inline void generate_antidisasm_junk(uint8_t* buf, size_t size, std::mt19937& rng) {
+        size_t pos = 0;
+        while (pos < size) {
+            size_t remaining = size - pos;
+            size_t written = emit_antidisasm_pattern(buf + pos, remaining, rng);
+            if (written == 0) {
+                // Should never happen, but safety: fill rest with invalid bytes
+                buf[pos] = 0x06; // PUSH ES - invalid in x64 long mode
+                written = 1;
+            }
+            pos += written;
+        }
+    }
+
 } // namespace opcode

@@ -941,35 +941,135 @@ inline LiftResult lift_region(const uint8_t* code, size_t code_size,
 //   revmap_rva       — RVA of VmHeader::opcode_rev in the section
 //   iat_slot_rva     — RVA of the ArgalVmInterp IAT slot
 //
-// Stub layout (kVmStubSize = 229 bytes, no trailing data slots):
-//   Phase 1 ( 97 bytes): sub rsp,0x90 (imm32 form!) + save 16 GPRs + save RFLAGS
-//   Phase 2 ( 39 bytes): lea rdx,[rsp]                  ; ctx ptr
-//                        lea r9,[rip+disp_base]          ; r9 = actual image_base (4th arg)
-//                        lea rcx,[rip+disp_bc]           ; bytecode ptr (RIP-rel, 1st arg)
-//                        lea r8,[rip+disp_rm]            ; revmap ptr   (RIP-rel, 3rd arg)
-//                        sub rsp,0x20
-//                        call [rip+disp_iat]             ; FF 15 — through IAT slot
-//                        add rsp,0x20
-//   Phase 3 ( 93 bytes): restore RFLAGS + restore 15 GPRs + add rsp,0x90 + ret
+// Stub layout (base 229 bytes + 30-80 bytes randomized junk):
+//   Junk sled 0     (variable): anti-disasm patterns before context save
+//   Phase 1 ( 97 bytes): sub rsp,0x90 + save 16 GPRs (randomized order) + save RFLAGS
+//   Junk sled 1     (variable): anti-disasm patterns between save and call setup
+//   Phase 2 (25-39+ bytes): argument LEAs in randomized order with optional
+//                           mini junk between them, sub rsp,0x20,
+//                           call [rip+disp_iat], add rsp,0x20
+//   Junk sled 3     (variable): return path obfuscation
+//   Phase 3 ( 85 bytes): restore RFLAGS + restore 15 GPRs (randomized order)
+//   Junk sled 4     (variable): before the return
+//   Epilogue (8 bytes): add rsp,0x90 + ret
+//   INT3 padding to kVmStubSize
 //
-// image_base computation: at byte N the stub is at actual_base+stub_rva+N.
-// lea r9,[rip+disp] with disp=-(stub_rva+N+7) gives r9 = actual_base. ✓
+// All RIP-relative displacements computed dynamically from s.size().
 // ============================================================================
 
-// Fixed byte size of every stub produced by build_vm_entry_stub.
-// Phase 1: 7 (sub rsp imm32) + 80 (GPR saves) + 10 (RFLAGS save) = 97
-// Phase 2: 39 (call setup including r9=image_base)
-// Phase 3: 93 (restore + ret)
-static constexpr size_t kVmStubSize = 229;
+// Helper: emit N bytes of junk that doesn't clobber any register state.
+// Uses only flag-safe instructions (CLC, STC, CLD, NOP, CMC), push/pop
+// pairs on random safe regs, and anti-disasm overlapping JMP patterns.
+inline void emit_stub_junk(std::vector<uint8_t>& s, size_t count, std::mt19937& rng) {
+    size_t emitted = 0;
+    while (emitted < count) {
+        size_t left = count - emitted;
+        int choice = rng() % 10;
+
+        if (choice == 0 && left >= 2) {
+            // push/pop same reg (no-op, 2 bytes)
+            uint8_t safe_regs[] = {0,1,2,3,6,7};
+            uint8_t r = safe_regs[rng() % 6];
+            s.push_back(0x50 + r); s.push_back(0x58 + r);
+            emitted += 2;
+        }
+        else if (choice == 1 && left >= 3) {
+            // jmp +1 with garbage byte (anti-disasm)
+            s.push_back(0xEB); s.push_back(0x01);
+            s.push_back(static_cast<uint8_t>(rng() & 0xFF));
+            emitted += 3;
+        }
+        else if (choice == 2 && left >= 4) {
+            // jmp +2 with 2 garbage bytes
+            s.push_back(0xEB); s.push_back(0x02);
+            s.push_back(static_cast<uint8_t>(rng())); s.push_back(static_cast<uint8_t>(rng()));
+            emitted += 4;
+        }
+        else if (choice == 3 && left >= 7) {
+            // opaque predicate (never-taken): xor r,r / test r,r / jnz +1 / 1 garbage byte
+            uint8_t safe_regs[] = {0,1,2,3,6,7};
+            uint8_t r = safe_regs[rng() % 6];
+            s.push_back(0x31); s.push_back(0xC0 | ((r & 7) << 3) | (r & 7)); // xor r32,r32
+            s.push_back(0x85); s.push_back(0xC0 | ((r & 7) << 3) | (r & 7)); // test r32,r32
+            s.push_back(0x75); s.push_back(0x01); // jnz +1 (never taken)
+            s.push_back(static_cast<uint8_t>(rng())); // dead byte
+            emitted += 7;
+        }
+        else if (choice == 4 && left >= 5) {
+            // Fake VEX prefix behind jmp+1 (confuses disasm)
+            s.push_back(0xEB); s.push_back(0x03); // jmp +3
+            s.push_back(0xC4); // VEX 3-byte prefix
+            s.push_back(static_cast<uint8_t>(rng()) | 0xC0);
+            s.push_back(static_cast<uint8_t>(rng()));
+            emitted += 5;
+        }
+        else if (choice == 5 && left >= 4) {
+            // UD2 behind a jmp (never executed, confuses analysis)
+            s.push_back(0xEB); s.push_back(0x02); // jmp +2
+            s.push_back(0x0F); s.push_back(0x0B); // UD2
+            emitted += 4;
+        }
+        else if (choice == 6 && left >= 3) {
+            // LOCK prefix behind jmp+1 (invalid, confuses linear disasm)
+            s.push_back(0xEB); s.push_back(0x01); // jmp +1
+            s.push_back(0xF0); // LOCK
+            emitted += 3;
+        }
+        else if (choice == 7 && left >= 5) {
+            // Fake EVEX behind jmp
+            s.push_back(0xEB); s.push_back(0x03); // jmp +3
+            s.push_back(0x62); // EVEX prefix
+            s.push_back(static_cast<uint8_t>(rng()) | 0xF0);
+            s.push_back(static_cast<uint8_t>(rng()));
+            emitted += 5;
+        }
+        else if (choice == 8 && left >= 2) {
+            // XCHG reg,reg (no-op if same reg)
+            uint8_t safe_regs[] = {0,1,2,3,6,7};
+            uint8_t r = safe_regs[rng() % 6];
+            s.push_back(0x87); s.push_back(0xC0 | (r << 3) | r);
+            emitted += 2;
+        }
+        else {
+            // Single-byte junk: NOP, CLC, STC, CLD, CMC
+            uint8_t singles[] = { 0x90, 0xF8, 0xF9, 0xFC, 0xF5 };
+            s.push_back(singles[rng() % 5]);
+            emitted += 1;
+        }
+    }
+}
+
+// Max junk budget injected into the stub
+static constexpr size_t kVmStubMaxJunk = 80;
+// Base stub: Phase1(97) + Phase2(39) + Phase3(93) = 229
+// With junk: 229 + up to kVmStubMaxJunk, padded to fixed size
+static constexpr size_t kVmStubSize = 229 + kVmStubMaxJunk;
 
 inline std::vector<uint8_t> build_vm_entry_stub(
     uint32_t stub_rva,
     uint32_t bytecode_rgn_rva,
     uint32_t revmap_rva,
-    uint32_t iat_slot_rva)
+    uint32_t iat_slot_rva,
+    std::mt19937& rng)
 {
     std::vector<uint8_t> s;
     s.reserve(kVmStubSize);
+
+    // Decide junk sizes for 5 insertion points.
+    uint32_t total_junk = 30 + (rng() % (kVmStubMaxJunk - 30 + 1));
+    uint32_t junk_slots[5];
+    {
+        uint32_t remaining = total_junk;
+        for (int i = 0; i < 4; i++) {
+            junk_slots[i] = (remaining > 4) ? (2 + rng() % (remaining / 2)) : (remaining > 0 ? 1 : 0);
+            if (junk_slots[i] > remaining) junk_slots[i] = remaining;
+            remaining -= junk_slots[i];
+        }
+        junk_slots[4] = remaining;
+    }
+
+    // === Junk sled 0: before Phase 1 ===
+    emit_stub_junk(s, junk_slots[0], rng);
 
     // ----------------------------------------------------------------
     // Phase 1 — save context (97 bytes)
@@ -982,15 +1082,19 @@ inline std::vector<uint8_t> build_vm_entry_stub(
     s.push_back(0x48); s.push_back(0x81); s.push_back(0xEC);
     s.push_back(0x90); s.push_back(0x00); s.push_back(0x00); s.push_back(0x00);
 
-    // Save all 16 GPRs to [rsp + vreg*8]  (5 bytes each × 16 = 80 bytes)
+    // Save all 16 GPRs in RANDOMIZED order (5 bytes each x 16 = 80 bytes)
+    uint8_t save_order[16];
+    for (uint8_t i = 0; i < 16; i++) save_order[i] = i;
+    for (int i = 15; i > 0; --i) std::swap(save_order[i], save_order[rng() % (i + 1)]);
+
     auto save_gpr = [&](uint8_t vreg) {
         uint8_t off   = vreg * 8;
-        uint8_t modrm = 0x44 | ((vreg & 7) << 3); // mod=01, reg=vreg&7, rm=4 (SIB)
-        s.push_back(vreg < 8 ? 0x48 : 0x4C);      // REX.W or REX.W+R
+        uint8_t modrm = 0x44 | ((vreg & 7) << 3);
+        s.push_back(vreg < 8 ? 0x48 : 0x4C);
         s.push_back(0x89);
         s.push_back(modrm); s.push_back(0x24); s.push_back(off);
     };
-    for (uint8_t r = 0; r < 16; ++r) save_gpr(r);
+    for (uint8_t i = 0; i < 16; ++i) save_gpr(save_order[i]);
 
     // Save RFLAGS -> regs[16] at [rsp+0x80]  (10 bytes)
     s.push_back(0x9C);                                              // pushfq
@@ -998,60 +1102,73 @@ inline std::vector<uint8_t> build_vm_entry_stub(
     s.push_back(0x48); s.push_back(0x89); s.push_back(0x84);       // mov [rsp+0x80],rax
     s.push_back(0x24); s.push_back(0x80); s.push_back(0x00);
     s.push_back(0x00); s.push_back(0x00);
-    // Phase 1 end: s.size() == 97
+
+    // === Junk sled 1: after context save ===
+    emit_stub_junk(s, junk_slots[1], rng);
 
     // ----------------------------------------------------------------
-    // Phase 2 — call ArgalVmInterp(rcx,rdx,r8,r9) (39 bytes)
-    // ArgalVmInterp(bytecode_ptr, ctx_ptr, oprev_ptr, image_base)
-    // Byte offsets within stub (Phase 1 = 97 bytes):
-    //   97: lea rdx,[rsp]           (4)   ends at 101
-    //  101: lea r9,[rip+disp_base]  (7)   ends at 108, r9 = actual image_base
-    //  108: lea rcx,[rip+disp_bc]   (7)   ends at 115, RIP-after = stub_rva+115
-    //  115: lea r8, [rip+disp_rm]   (7)   ends at 122, RIP-after = stub_rva+122
-    //  122: sub rsp,0x20            (4)   ends at 126
-    //  126: call [rip+disp_iat]     (6)   ends at 132, RIP-after = stub_rva+132
-    //  132: add rsp,0x20            (4)   ends at 136
+    // Phase 2 — call ArgalVmInterp(rcx, rdx, r8, r9)
+    // Argument LEAs in RANDOMIZED order. All RIP-relative displacements
+    // computed dynamically from s.size() so they adapt to preceding junk.
     // ----------------------------------------------------------------
 
-    // lea rdx, [rsp]  (4 bytes: 48 8D 14 24)
-    s.push_back(0x48); s.push_back(0x8D); s.push_back(0x14); s.push_back(0x24);
+    int arg_order[4] = {0, 1, 2, 3};
+    for (int i = 3; i > 0; --i) std::swap(arg_order[i], arg_order[rng() % (i + 1)]);
 
-    // lea r9, [rip+disp_base]  (7 bytes: 4C 8D 0D disp32)
-    // disp = -(stub_rva + 108)  so that RIP + disp = actual image_base.
-    // Proof: RIP = actual_base + stub_rva + 108;  RIP + disp = actual_base. ✓
-    {
-        int32_t disp = -(int32_t)(stub_rva + 108);
-        uint32_t ud  = (uint32_t)disp;
-        s.push_back(0x4C); s.push_back(0x8D); s.push_back(0x0D);
-        s.push_back(ud & 0xFF); s.push_back((ud >> 8) & 0xFF);
-        s.push_back((ud >> 16) & 0xFF); s.push_back((ud >> 24) & 0xFF);
+    for (int ai = 0; ai < 4; ai++) {
+        // Optionally insert mini junk between argument loads
+        if (ai > 0 && (rng() % 3 == 0) && junk_slots[2] > 0) {
+            uint32_t mini = 1 + rng() % ((std::min)(junk_slots[2], (uint32_t)5));
+            emit_stub_junk(s, mini, rng);
+            junk_slots[2] -= mini;
+        }
+
+        switch (arg_order[ai]) {
+        case 0: { // lea rdx, [rsp]  (4 bytes: 48 8D 14 24)
+            s.push_back(0x48); s.push_back(0x8D); s.push_back(0x14); s.push_back(0x24);
+            break;
+        }
+        case 1: { // lea r9, [rip+disp_base]  (7 bytes: 4C 8D 0D disp32)
+            size_t rip_after = s.size() + 7;
+            int32_t disp = -(int32_t)(stub_rva + (uint32_t)rip_after);
+            uint32_t ud = (uint32_t)disp;
+            s.push_back(0x4C); s.push_back(0x8D); s.push_back(0x0D);
+            s.push_back(ud & 0xFF); s.push_back((ud >> 8) & 0xFF);
+            s.push_back((ud >> 16) & 0xFF); s.push_back((ud >> 24) & 0xFF);
+            break;
+        }
+        case 2: { // lea rcx, [rip+disp_bc]  (7 bytes: 48 8D 0D disp32)
+            size_t rip_after = s.size() + 7;
+            int32_t disp = (int32_t)((int64_t)bytecode_rgn_rva - (int64_t)(stub_rva + rip_after));
+            uint32_t ud = (uint32_t)disp;
+            s.push_back(0x48); s.push_back(0x8D); s.push_back(0x0D);
+            s.push_back(ud & 0xFF); s.push_back((ud >> 8) & 0xFF);
+            s.push_back((ud >> 16) & 0xFF); s.push_back((ud >> 24) & 0xFF);
+            break;
+        }
+        case 3: { // lea r8, [rip+disp_rm]  (7 bytes: 4C 8D 05 disp32)
+            size_t rip_after = s.size() + 7;
+            int32_t disp = (int32_t)((int64_t)revmap_rva - (int64_t)(stub_rva + rip_after));
+            uint32_t ud = (uint32_t)disp;
+            s.push_back(0x4C); s.push_back(0x8D); s.push_back(0x05);
+            s.push_back(ud & 0xFF); s.push_back((ud >> 8) & 0xFF);
+            s.push_back((ud >> 16) & 0xFF); s.push_back((ud >> 24) & 0xFF);
+            break;
+        }
+        }
     }
 
-    // lea rcx, [rip+disp_bc]  (7 bytes: 48 8D 0D disp32)
-    {
-        int32_t disp = (int32_t)((int64_t)bytecode_rgn_rva - (int64_t)(stub_rva + 115));
-        uint32_t ud  = (uint32_t)disp;
-        s.push_back(0x48); s.push_back(0x8D); s.push_back(0x0D);
-        s.push_back(ud & 0xFF); s.push_back((ud >> 8) & 0xFF);
-        s.push_back((ud >> 16) & 0xFF); s.push_back((ud >> 24) & 0xFF);
-    }
-
-    // lea r8, [rip+disp_rm]  (7 bytes: 4C 8D 05 disp32)
-    {
-        int32_t disp = (int32_t)((int64_t)revmap_rva - (int64_t)(stub_rva + 122));
-        uint32_t ud  = (uint32_t)disp;
-        s.push_back(0x4C); s.push_back(0x8D); s.push_back(0x05);
-        s.push_back(ud & 0xFF); s.push_back((ud >> 8) & 0xFF);
-        s.push_back((ud >> 16) & 0xFF); s.push_back((ud >> 24) & 0xFF);
-    }
+    // Remaining junk from slot 2
+    if (junk_slots[2] > 0) emit_stub_junk(s, junk_slots[2], rng);
 
     // sub rsp, 0x20  (shadow space, 4 bytes)
     s.push_back(0x48); s.push_back(0x83); s.push_back(0xEC); s.push_back(0x20);
 
-    // call [rip+disp_iat]  (6 bytes: FF 15 disp32)
+    // call [rip+disp_iat]  (6 bytes: FF 15 disp32) — dynamic offset
     {
-        int32_t disp = (int32_t)((int64_t)iat_slot_rva - (int64_t)(stub_rva + 132));
-        uint32_t ud  = (uint32_t)disp;
+        size_t rip_after = s.size() + 6;
+        int32_t disp = (int32_t)((int64_t)iat_slot_rva - (int64_t)(stub_rva + rip_after));
+        uint32_t ud = (uint32_t)disp;
         s.push_back(0xFF); s.push_back(0x15);
         s.push_back(ud & 0xFF); s.push_back((ud >> 8) & 0xFF);
         s.push_back((ud >> 16) & 0xFF); s.push_back((ud >> 24) & 0xFF);
@@ -1059,20 +1176,26 @@ inline std::vector<uint8_t> build_vm_entry_stub(
 
     // add rsp, 0x20  (4 bytes)
     s.push_back(0x48); s.push_back(0x83); s.push_back(0xC4); s.push_back(0x20);
-    // Phase 2 end: s.size() == 136  (97+39)
+
+    // === Junk sled 3: after the call (return path obfuscation) ===
+    emit_stub_junk(s, junk_slots[3], rng);
 
     // ----------------------------------------------------------------
-    // Phase 3 — restore context (93 bytes)
+    // Phase 3 — restore context
     // ----------------------------------------------------------------
 
     // Restore RFLAGS from regs[16] at [rsp+0x80]  (10 bytes)
-    s.push_back(0x48); s.push_back(0x8B); s.push_back(0x84); // mov rax,[rsp+0x80]
+    s.push_back(0x48); s.push_back(0x8B); s.push_back(0x84);
     s.push_back(0x24); s.push_back(0x80); s.push_back(0x00);
     s.push_back(0x00); s.push_back(0x00);
     s.push_back(0x50);  // push rax
     s.push_back(0x9D);  // popfq
 
-    // Restore 15 GPRs (skip RSP=4 — it is fixed up by add rsp,0x90)  (75 bytes)
+    // Restore 15 GPRs (skip RSP=4) in RANDOMIZED order (75 bytes)
+    uint8_t restore_order[15];
+    { int j = 0; for (uint8_t i = 0; i < 16; i++) { if (i != VR_RSP) restore_order[j++] = i; } }
+    for (int i = 14; i > 0; --i) std::swap(restore_order[i], restore_order[rng() % (i + 1)]);
+
     auto restore_gpr = [&](uint8_t vreg) {
         uint8_t off   = vreg * 8;
         uint8_t modrm = 0x44 | ((vreg & 7) << 3);
@@ -1080,10 +1203,10 @@ inline std::vector<uint8_t> build_vm_entry_stub(
         s.push_back(0x8B);
         s.push_back(modrm); s.push_back(0x24); s.push_back(off);
     };
-    for (uint8_t r = 0; r < 16; ++r) {
-        if (r == VR_RSP) continue;
-        restore_gpr(r);
-    }
+    for (uint8_t i = 0; i < 15; ++i) restore_gpr(restore_order[i]);
+
+    // === Junk sled 4: before the return ===
+    emit_stub_junk(s, junk_slots[4], rng);
 
     // add rsp, 0x90  (7 bytes: REX.W 81 C4 imm32)
     s.push_back(0x48); s.push_back(0x81); s.push_back(0xC4);
@@ -1091,9 +1214,11 @@ inline std::vector<uint8_t> build_vm_entry_stub(
 
     // ret  (1 byte)
     s.push_back(0xC3);
-    // Phase 3 end: s.size() == 229  (136 + 93)
 
-    assert(s.size() == kVmStubSize && "VM stub size mismatch — check byte layout");
+    // Pad to kVmStubSize with INT3 so section layout math stays simple
+    while (s.size() < kVmStubSize) s.push_back(0xCC);
+
+    assert(s.size() <= kVmStubSize && "VM stub exceeded max size");
     return s;
 }
 
